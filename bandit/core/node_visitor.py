@@ -7,6 +7,7 @@ import logging
 import operator
 
 from bandit.core import constants
+from bandit.core import name_resolution as b_names
 from bandit.core import tester as b_tester
 from bandit.core import utils as b_utils
 
@@ -29,7 +30,8 @@ class BanditNodeVisitor:
         self.metaast = metaast
         self.testset = testset
         self.imports = set()
-        self.import_aliases = {}
+        self.resolver = None
+        self._prebound_targets = set()
         self.tester = b_tester.BanditTester(
             self.testset, self.debug, nosec_lines, metrics
         )
@@ -87,8 +89,13 @@ class BanditNodeVisitor:
         """
 
         self.context["call"] = node
-        qualname = b_utils.get_call_name(node, self.import_aliases)
-        name = qualname.split(".")[-1]
+        qualname = self.resolver.resolve_call_name(node)
+        if isinstance(node.func, ast.Attribute):
+            name = node.func.attr
+        elif isinstance(node.func, ast.Name):
+            name = node.func.id
+        else:
+            name = ""
 
         self.context["qualname"] = qualname
         self.context["name"] = name
@@ -105,7 +112,12 @@ class BanditNodeVisitor:
         """
         for nodename in node.names:
             if nodename.asname:
-                self.import_aliases[nodename.asname] = nodename.name
+                bound_name = nodename.asname
+                qualified_name = nodename.name
+            else:
+                bound_name = nodename.name.split(".")[0]
+                qualified_name = bound_name
+            self.resolver.assign(bound_name, qualified_name)
             self.imports.add(nodename.name)
             self.context["module"] = nodename.name
         self.update_scores(self.tester.run_tests(self.context, "Import"))
@@ -123,25 +135,207 @@ class BanditNodeVisitor:
             return self.visit_Import(node)
 
         for nodename in node.names:
-            # TODO(ljfisher) Names in import_aliases could be overridden
-            #      by local definitions. If this occurs bandit will see the
-            #      name in import_aliases instead of the local definition.
-            #      We need better tracking of names.
-            if nodename.asname:
-                self.import_aliases[nodename.asname] = (
-                    module + "." + nodename.name
-                )
+            if nodename.name == "*":
+                # Star imports cannot be resolved without importing the
+                # target module, which Bandit must never execute.
+                continue
+            bound_name = nodename.asname or nodename.name
+            if node.level:
+                # Relative imports depend on the package containing the
+                # scanned file; record the binding as a local object instead
+                # of guessing a cross-file qualified name.
+                qualified_name = b_names.UNRESOLVED
             else:
-                # Even if import is not aliased we need an entry that maps
-                # name to module.name.  For example, with 'from a import b'
-                # b should be aliased to the qualified name a.b
-                self.import_aliases[nodename.name] = (
-                    module + "." + nodename.name
-                )
+                qualified_name = module + "." + nodename.name
+            self.resolver.assign(bound_name, qualified_name)
             self.imports.add(module + "." + nodename.name)
             self.context["module"] = module
             self.context["name"] = nodename.name
         self.update_scores(self.tester.run_tests(self.context, "ImportFrom"))
+
+    def visit_Assign(self, node):
+        """Bind assignment targets after the value expression is visited."""
+        self._visit_node(node.value, node)
+        rhs_binding = self.resolver.binding_for_expression(node.value)
+        for target in node.targets:
+            self._bind_assignment_value(target, rhs_binding)
+            self._visit_node(target, node)
+        self._prebound_targets.clear()
+        node._bandit_children_handled = True
+
+    def visit_AnnAssign(self, node):
+        if node.annotation is not None:
+            self._visit_node(node.annotation, node)
+        if node.value is not None:
+            self._visit_node(node.value, node)
+            rhs_binding = self.resolver.binding_for_expression(node.value)
+            if isinstance(node.target, ast.Name):
+                self.resolver.assign(node.target.id, rhs_binding)
+        self._visit_node(node.target, node)
+        self._prebound_targets.clear()
+        node._bandit_children_handled = True
+
+    def visit_AugAssign(self, node):
+        # The target is read before being written, but its post-assignment
+        # identity is unknown.
+        self._visit_node(node.target, node)
+        self._visit_node(node.value, node)
+        node._bandit_children_handled = True
+
+    def visit_NamedExpr(self, node):
+        self._visit_node(node.value, node)
+        if isinstance(node.target, ast.Name):
+            rhs_binding = self.resolver.binding_for_expression(node.value)
+            self.resolver.assign(node.target.id, rhs_binding)
+        self._visit_node(node.target, node)
+        self._prebound_targets.clear()
+        node._bandit_children_handled = True
+
+    def _bind_assignment_value(self, target, value):
+        if isinstance(target, ast.Name):
+            self.resolver.assign(target.id, value)
+            self._prebound_targets.add(id(target))
+        elif isinstance(target, (ast.Tuple, ast.List)):
+            # Tuple/list unpacking cannot statically map one RHS identity to
+            # each element; mark every bound name unresolved.
+            for element in target.elts:
+                self._bind_assignment_value(element, value)
+        elif isinstance(target, ast.Starred):
+            self._bind_assignment_value(target.value, value)
+
+    def visit_Global(self, node):
+        self.resolver.declare_global(node.names)
+
+    def visit_Nonlocal(self, node):
+        self.resolver.declare_nonlocal(node.names)
+
+    def visit_Delete(self, node):
+        for target in node.targets:
+            self._visit_node(target, node)
+        node._bandit_children_handled = True
+
+    def visit_For(self, node):
+        self._visit_loop(
+            node,
+            iterable=node.iter,
+            target=node.target,
+            body=node.body,
+            orelse=node.orelse,
+        )
+
+    def visit_AsyncFor(self, node):
+        self._visit_loop(
+            node,
+            iterable=node.iter,
+            target=node.target,
+            body=node.body,
+            orelse=node.orelse,
+        )
+
+    def visit_While(self, node):
+        self._visit_node(node.test, node)
+        self._merge_branches(
+            node,
+            branches=[node.body],
+            fallback=node.orelse,
+            conservative=True,
+        )
+        node._bandit_children_handled = True
+
+    def visit_If(self, node):
+        self._visit_node(node.test, node)
+        self._merge_branches(
+            node,
+            branches=[node.body],
+            fallback=node.orelse,
+            conservative=False,
+        )
+        node._bandit_children_handled = True
+
+    def visit_Try(self, node):
+        branches = [node.body]
+        for handler in node.handlers:
+            branches.append([handler])
+        if node.orelse:
+            branches.append(node.orelse)
+        self._merge_branches(
+            node,
+            branches=branches,
+            fallback=node.finalbody,
+            conservative=True,
+        )
+        node._bandit_children_handled = True
+
+    def visit_ExceptHandler(self, node):
+        self._run_node_tests(node)
+        if node.type is not None:
+            self._visit_node(node.type, node)
+        if node.name is not None:
+            self.resolver.assign(node.name, b_names.UNRESOLVED)
+        for statement in node.body:
+            self._visit_node(statement, node)
+        node._bandit_children_handled = True
+
+    def _run_node_tests(self, node):
+        """Run tests registered for a node type without redispatching."""
+        checktype = node.__class__.__name__
+        self.update_scores(self.tester.run_tests(self.context, checktype))
+
+    def visit_Match(self, node):
+        self._visit_node(node.subject, node)
+        branches = [case.body for case in node.cases]
+        self._merge_branches(
+            node,
+            branches=branches,
+            fallback=[],
+            conservative=True,
+        )
+        node._bandit_children_handled = True
+
+    def _visit_loop(self, node, iterable, target, body, orelse):
+        self._visit_node(iterable, node)
+        self._visit_node(target, node)
+        # Loop bodies may execute zero or many times, so names bound there
+        # cannot retain an imported identity after the loop.
+        self._merge_branches(
+            node,
+            branches=[body],
+            fallback=orelse,
+            conservative=True,
+        )
+        node._bandit_children_handled = True
+
+    def _merge_branches(self, node, branches, fallback, conservative):
+        base_snapshot = self.resolver.snapshot()
+        branch_snapshots = []
+        for branch in branches:
+            base_snapshot.restore(self.resolver)
+            for statement in branch:
+                self._visit_node(statement, node)
+            branch_snapshots.append(self.resolver.snapshot())
+        if fallback:
+            base_snapshot.restore(self.resolver)
+            for statement in fallback:
+                self._visit_node(statement, node)
+            branch_snapshots.append(self.resolver.snapshot())
+        base_snapshot.restore(self.resolver)
+        if conservative:
+            self.resolver.conservative_merge(
+                base_snapshot, branch_snapshots
+            )
+        else:
+            self.resolver.merge(base_snapshot, branch_snapshots)
+
+    def _visit_node(self, node, parent=None):
+        if isinstance(node, ast.AST):
+            node._bandit_sibling = None
+            if parent is None:
+                parent = getattr(
+                    node, "_bandit_parent", self.context["node"]
+                )
+            self._drive_child(
+                parent, node
+            )
 
     def visit_Constant(self, node):
         """Visitor for AST Constant nodes
@@ -187,9 +381,27 @@ class BanditNodeVisitor:
             self.update_scores(self.tester.run_tests(self.context, "Bytes"))
 
     def pre_visit(self, node):
+        self.resolver.enter_node(node)
+
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+            # Import visitors replace this unresolved binding with the
+            # imported qualified name.  Assignment visitors arrange traversal
+            # so the value is resolved before this event.
+            parent = getattr(node, "_bandit_parent", None)
+            if (
+                not isinstance(parent, ast.AugAssign)
+                and id(node) not in self._prebound_targets
+            ):
+                self.resolver.assign(node.id, b_names.UNRESOLVED)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Del):
+            self.resolver.delete(node.id)
+
         self.context = {}
         self.context["imports"] = self.imports
-        self.context["import_aliases"] = self.import_aliases
+        self.context["import_aliases"] = b_names.ImportAliasesView(
+            self.resolver
+        )
+        self.context["name_resolver"] = self.resolver
 
         if self.debug:
             LOG.debug(ast.dump(node))
@@ -227,6 +439,12 @@ class BanditNodeVisitor:
             self.update_scores(self.tester.run_tests(self.context, name))
 
     def post_visit(self, node):
+        self.resolver.exit_node(node)
+        if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            # The name belongs to the enclosing scope, which is now on top.
+            self.resolver.assign(node.name, b_names.UNRESOLVED)
         self.depth -= 1
         LOG.debug("%s\texiting : %s", self.depth, hex(id(node)))
 
@@ -237,6 +455,9 @@ class BanditNodeVisitor:
 
     def generic_visit(self, node):
         """Drive the visitor."""
+        if getattr(node, "_bandit_children_handled", False):
+            node._bandit_children_handled = False
+            return
         for _, value in ast.iter_fields(node):
             if isinstance(value, list):
                 max_idx = len(value) - 1
@@ -246,20 +467,19 @@ class BanditNodeVisitor:
                             item._bandit_sibling = value[idx + 1]
                         else:
                             item._bandit_sibling = None
-                        item._bandit_parent = node
-
-                        if self.pre_visit(item):
-                            self.visit(item)
-                            self.generic_visit(item)
-                            self.post_visit(item)
+                        self._drive_child(node, item)
 
             elif isinstance(value, ast.AST):
                 value._bandit_sibling = None
-                value._bandit_parent = node
-                if self.pre_visit(value):
-                    self.visit(value)
-                    self.generic_visit(value)
-                    self.post_visit(value)
+
+                self._drive_child(node, value)
+
+    def _drive_child(self, parent, node):
+        node._bandit_parent = parent
+        if self.pre_visit(node):
+            self.visit(node)
+            self.generic_visit(node)
+            self.post_visit(node)
 
     def update_scores(self, scores):
         """Score updater
@@ -283,7 +503,8 @@ class BanditNodeVisitor:
         :return score: the aggregated score for the current file
         """
         f_ast = ast.parse(data)
-        self.generic_visit(f_ast)
+        self.resolver = b_names.NameResolver(f_ast)
+        self._drive_child(None, f_ast)
         # Run tests that do not require access to the AST,
         # but only to the whole file source:
         self.context = {

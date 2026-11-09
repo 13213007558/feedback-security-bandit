@@ -206,7 +206,11 @@ def subprocess_popen_with_shell_equals_true(context, config):
         CWE information added
 
     """  # noqa: E501
-    if config and context.call_function_name_qual in config["subprocess"]:
+    if (
+        config
+        and not context.call_root_is_shadowed_local()
+        and context.call_function_name_qual in config["subprocess"]
+    ):
         if has_shell(context):
             if len(context.call_args) > 0:
                 sev = _evaluate_shell_call(context)
@@ -305,7 +309,11 @@ def subprocess_without_shell_equals_true(context, config):
         CWE information added
 
     """  # noqa: E501
-    if config and context.call_function_name_qual in config["subprocess"]:
+    if (
+        config
+        and not context.call_root_is_shadowed_local()
+        and context.call_function_name_qual in config["subprocess"]
+    ):
         if not has_shell(context):
             return bandit.Issue(
                 severity=bandit.LOW,
@@ -390,7 +398,10 @@ def any_other_function_with_shell_equals_true(context, config):
         CWE information added
 
     """  # noqa: E501
-    if config and context.call_function_name_qual not in config["subprocess"]:
+    if config and (
+        context.call_root_is_shadowed_local()
+        or context.call_function_name_qual not in config["subprocess"]
+    ):
         if has_shell(context):
             return bandit.Issue(
                 severity=bandit.MEDIUM,
@@ -483,7 +494,11 @@ def start_process_with_a_shell(context, config):
         CWE information added
 
     """  # noqa: E501
-    if config and context.call_function_name_qual in config["shell"]:
+    if (
+        config
+        and not context.call_root_is_shadowed_local()
+        and context.call_function_name_qual in config["shell"]
+    ):
         if len(context.call_args) > 0:
             sev = _evaluate_shell_call(context)
             if sev == bandit.LOW:
@@ -590,7 +605,11 @@ def start_process_with_no_shell(context, config):
 
     """  # noqa: E501
 
-    if config and context.call_function_name_qual in config["no_shell"]:
+    if (
+        config
+        and not context.call_root_is_shadowed_local()
+        and context.call_function_name_qual in config["no_shell"]
+    ):
         return bandit.Issue(
             severity=bandit.LOW,
             confidence=bandit.MEDIUM,
@@ -682,7 +701,7 @@ def start_process_with_partial_path(context, config):
     """
 
     if config and len(context.call_args):
-        if (
+        if not context.call_root_is_shadowed_local() and (
             context.call_function_name_qual in config["subprocess"]
             or context.call_function_name_qual in config["shell"]
             or context.call_function_name_qual in config["no_shell"]

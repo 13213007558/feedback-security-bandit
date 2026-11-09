@@ -115,9 +115,12 @@ def linux_commands_wildcard_injection(context, config):
         return
 
     vulnerable_funcs = ["chown", "chmod", "tar", "rsync"]
-    if context.call_function_name_qual in config["shell"] or (
-        context.call_function_name_qual in config["subprocess"]
-        and context.check_call_arg_value("shell", "True")
+    if not context.call_root_is_shadowed_local() and (
+        context.call_function_name_qual in config["shell"]
+        or (
+            context.call_function_name_qual in config["subprocess"]
+            and context.check_call_arg_value("shell", "True")
+        )
     ):
         if context.call_args_count >= 1:
             call_argument = context.get_call_arg_at_position(0)

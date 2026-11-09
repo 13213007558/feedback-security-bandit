@@ -4,6 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import ast
 
+from bandit.core import name_resolution
 from bandit.core import utils
 
 
@@ -314,3 +315,35 @@ class Context:
     @property
     def import_aliases(self):
         return self._context.get("import_aliases")
+
+    @property
+    def name_resolver(self):
+        return self._context.get("name_resolver")
+
+    def call_root_is_shadowed_local(self):
+        """Whether the call's lexical root is a known non-import binding.
+
+        Returns True only when the root name resolves to a concrete local
+        binding of unknown type (a parameter, assignment, nested class body
+        name, ...).  A genuinely imported root and a completely unbound free
+        name both return False; the latter preserves Bandit's historical
+        behavior of flagging syntactically dangerous calls even without a
+        visible import.
+        """
+        resolver = self.name_resolver
+        call = self._context.get("call")
+        if resolver is None or not isinstance(call, ast.Call):
+            return False
+        func = call.func
+        if isinstance(func, ast.Name):
+            found, value = resolver.lookup(func.id)
+            return found and value is name_resolution.UNRESOLVED
+        if isinstance(func, ast.Attribute):
+            current = func
+            while isinstance(current, ast.Attribute):
+                current = current.value
+            if not isinstance(current, ast.Name):
+                return False
+            found, value = resolver.lookup(current.id)
+            return found and value is name_resolution.UNRESOLVED
+        return False

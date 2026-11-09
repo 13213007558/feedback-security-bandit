@@ -117,6 +117,51 @@ class FunctionalTests(testtools.TestCase):
         }
         self.check_example("binding.py", expect)
 
+    def test_lexical_name_resolution_scopes(self):
+        """Import identity must follow Python lexical scoping rules."""
+        self.run_example("name_resolution_scopes.py")
+        issues = {
+            (issue.test_id, issue.lineno)
+            for issue in self.b_mgr.results
+        }
+
+        # Real, unshadowed subprocess bindings keep reporting B602.
+        for line in (20, 35, 40, 69):
+            self.assertIn(("B602", line), issues)
+
+        # Same-named local objects fall back to the generic B604 check and
+        # must never be treated as subprocess calls (no B602 on these lines).
+        for line in (14, 31, 50, 59):
+            self.assertIn(("B604", line), issues)
+            self.assertNotIn(("B602", line), issues)
+
+        # The class-body import is not visible to methods, so this call must
+        # not be treated as a subprocess call even though its name looks
+        # similar.
+        self.assertNotIn(("B602", 26), issues)
+
+    def test_name_resolution_isolated_per_file(self):
+        """Import bindings must not leak between separately scanned files."""
+        first = os.path.join(
+            os.getcwd(), "examples", "name_resolution_scopes.py"
+        )
+        second = os.path.join(
+            os.getcwd(), "examples", "name_resolution_second_file.py"
+        )
+        self.b_mgr.scores = []
+        self.b_mgr.discover_files([first, second], True)
+        self.b_mgr.run_tests()
+
+        second_issues = {
+            issue.test_id
+            for issue in self.b_mgr.results
+            if issue.fname == second
+        }
+        # The free-name call keeps the generic shell check but cannot inherit
+        # an imported subprocess identity from the first file.
+        self.assertIn("B604", second_issues)
+        self.assertNotIn("B602", second_issues)
+
     def test_crypto_md5(self):
         """Test the `hashlib.md5` example."""
         expect = {
