@@ -3,6 +3,7 @@
 #
 # SPDX-License-Identifier: Apache-2.0
 import collections
+import dataclasses
 import fnmatch
 import io
 import json
@@ -24,9 +25,37 @@ from bandit.core import node_visitor as b_node_visitor
 from bandit.core import test_set as b_test_set
 
 LOG = logging.getLogger(__name__)
-NOSEC_COMMENT = re.compile(r"#\s*nosec:?\s*(?P<tests>[^#]+)?#?")
+NOSEC_COMMENT = re.compile(r"#\s*nosec(?P<colon>:?)\s*(?P<tests>[^#]+)?#?")
 NOSEC_COMMENT_TESTS = re.compile(r"(?:(B\d+|[a-z\d_]+),?)+", re.IGNORECASE)
 PROGRESS_THRESHOLD = 50
+
+
+@dataclasses.dataclass
+class NosecComment:
+    """A parsed ``# nosec`` comment.
+
+    The three possible states must not be conflated:
+
+    * a bare nosec (``# nosec``) suppresses every finding on the line;
+    * a nosec listing tests suppresses only the tests that resolve to a
+      known test id;
+    * a nosec whose listed tests do not resolve to any known id suppresses
+      nothing and produces a locatable diagnostic.
+
+    ``blanket`` therefore represents the bare form, while ``test_ids``
+    holds only valid ids. Tokens that failed to resolve are kept in
+    ``invalid_tokens`` so callers can report them with their location.
+    """
+
+    lineno: int
+    blanket: bool
+    test_ids: set = dataclasses.field(default_factory=set)
+    invalid_tokens: list = dataclasses.field(default_factory=list)
+
+    @property
+    def has_effect(self):
+        """Whether the comment can suppress at least one finding."""
+        return self.blanket or bool(self.test_ids)
 
 
 class BanditManager:
@@ -305,8 +334,8 @@ class BanditManager:
             lines = data.splitlines()
             self.metrics.begin(fname)
             self.metrics.count_locs(lines)
-            # nosec_lines is a dict of line number -> set of tests to ignore
-            #                                         for the line
+            # nosec_lines is a dict of line number -> parsed nosec comment
+            # for the line. Lines without a nosec comment have no entry.
             nosec_lines = dict()
             try:
                 fdata.seek(0)
@@ -315,7 +344,18 @@ class BanditManager:
                 if not self.ignore_nosec:
                     for toktype, tokval, (lineno, _), _, _ in tokens:
                         if toktype == tokenize.COMMENT:
-                            nosec_lines[lineno] = _parse_nosec_comment(tokval)
+                            nosec = _parse_nosec_comment(tokval, lineno)
+                            if nosec is not None:
+                                nosec_lines[lineno] = nosec
+                                for token in nosec.invalid_tokens:
+                                    LOG.warning(
+                                        "nosec comment on %s:%s references "
+                                        "unknown test '%s'; no rule was "
+                                        "suppressed by it",
+                                        fname,
+                                        lineno,
+                                        token,
+                                    )
 
             except tokenize.TokenError:
                 pass
@@ -466,34 +506,64 @@ def _find_test_id_from_nosec_string(extman, match):
     if test_id:
         return match
     # Finding by short_id didn't work, let's check the test name
-    test_id = extman.get_test_id(match)
-    if not test_id:
-        # Name and short id didn't work:
-        LOG.warning(
-            "Test in comment: %s is not a test name or id, ignoring", match
-        )
-    return test_id  # We want to return None or the string here regardless
+    return extman.get_test_id(match)
 
 
-def _parse_nosec_comment(comment):
+def _parse_nosec_comment(comment, lineno):
+    """Parse a comment into a :class:`NosecComment`.
+
+    Returns ``None`` when the comment is not a nosec comment. Otherwise
+    the returned object distinguishes a bare nosec (blanket suppression)
+    from a nosec listing tests. Unknown or misspelled test references in
+    an explicit list are collected in ``invalid_tokens`` instead of being
+    silently dropped, so that an all-invalid list never collapses into
+    blanket suppression.
+
+    A nosec is treated as an explicit, validated list when it either uses
+    the colon form (``# nosec: ...``) or contains at least one token that
+    resolves to a known test. The colon form is authoritative: even when
+    every token is unknown it is an explicit list that suppresses nothing
+    and reports each unknown token. Without the colon and without any
+    resolvable token, trailing text is treated as prose on a bare nosec
+    (e.g. ``# nosec TODO``) and keeps the traditional blanket behavior.
+
+    :param comment: raw comment text including the leading ``#``
+    :param lineno: line the comment token was found on
+    :return: a parsed nosec comment or ``None``
+    """
     found_no_sec_comment = NOSEC_COMMENT.search(comment)
     if not found_no_sec_comment:
         # there was no nosec comment
         return None
 
-    matches = found_no_sec_comment.groupdict()
-    nosec_tests = matches.get("tests", set())
+    raw_tests = found_no_sec_comment.groupdict().get("tests")
+    explicit_colon = bool(found_no_sec_comment.groupdict()["colon"])
 
-    # empty set indicates that there was a nosec comment without specific
-    # test ids or names
+    # A nosec without any trailing text is a blanket suppression.
+    if not raw_tests or not raw_tests.strip():
+        return NosecComment(lineno=lineno, blanket=True)
+
+    extman = extension_loader.MANAGER
     test_ids = set()
-    if nosec_tests:
-        extman = extension_loader.MANAGER
-        # lookup tests by short code or name
-        for test in NOSEC_COMMENT_TESTS.finditer(nosec_tests):
-            test_match = test.group(1)
-            test_id = _find_test_id_from_nosec_string(extman, test_match)
-            if test_id:
-                test_ids.add(test_id)
+    invalid_tokens = []
+    # lookup tests by short code or name; duplicates collapse in the set
+    for test in NOSEC_COMMENT_TESTS.finditer(raw_tests):
+        test_match = test.group(1)
+        test_id = _find_test_id_from_nosec_string(extman, test_match)
+        if test_id:
+            test_ids.add(test_id)
+        else:
+            invalid_tokens.append(test_match)
 
-    return test_ids
+    # A colon explicitly requests rule-level suppression, or at least one
+    # token resolved to a real test. In both cases unknown tokens are
+    # diagnostics rather than prose and no blanket suppression applies.
+    if explicit_colon or test_ids:
+        return NosecComment(
+            lineno=lineno,
+            blanket=False,
+            test_ids=test_ids,
+            invalid_tokens=invalid_tokens,
+        )
+
+    return NosecComment(lineno=lineno, blanket=True)

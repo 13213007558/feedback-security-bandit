@@ -393,3 +393,91 @@ class ManagerTests(testtools.TestCase):
                 [issue_a, issue_b], [issue_a, issue_b, issue_c]
             ),
         )
+
+
+class NosecCommentParsingTests(testtools.TestCase):
+    def _parse(self, comment, lineno=1):
+        return manager._parse_nosec_comment(comment, lineno)
+
+    def test_non_nosec_comment_returns_none(self):
+        self.assertIsNone(self._parse("# just a regular comment"))
+
+    def test_bare_nosec_is_blanket(self):
+        nosec = self._parse("# nosec")
+        self.assertTrue(nosec.blanket)
+        self.assertEqual(set(), nosec.test_ids)
+        self.assertEqual([], nosec.invalid_tokens)
+        self.assertTrue(nosec.has_effect)
+
+    def test_bare_nosec_with_colon_is_blanket(self):
+        nosec = self._parse("# nosec:")
+        self.assertTrue(nosec.blanket)
+        self.assertEqual(set(), nosec.test_ids)
+
+    def test_bare_nosec_with_prose_remains_blanket(self):
+        for comment in (
+            "# nosec TODO",
+            "#nosec (on the line)",
+            "# nosec reviewed manually",
+        ):
+            nosec = self._parse(comment)
+            self.assertTrue(nosec.blanket, comment)
+            self.assertEqual(set(), nosec.test_ids, comment)
+
+    def test_all_invalid_ids_are_diagnostic_not_blanket(self):
+        nosec = self._parse("# nosec: B999999", lineno=7)
+        self.assertFalse(nosec.blanket)
+        self.assertEqual(set(), nosec.test_ids)
+        self.assertEqual(["B999999"], nosec.invalid_tokens)
+        self.assertEqual(7, nosec.lineno)
+        self.assertFalse(nosec.has_effect)
+
+    def test_all_invalid_without_colon_treated_as_bare_prose(self):
+        # Without the explicit colon marker, unresolvable trailing text is
+        # indistinguishable from prose, so the traditional blanket nosec
+        # semantics are preserved for backwards compatibility.
+        nosec = self._parse("# nosec B999999, B888888")
+        self.assertTrue(nosec.blanket)
+        self.assertEqual(set(), nosec.test_ids)
+        self.assertEqual([], nosec.invalid_tokens)
+
+    def test_partial_valid_keeps_valid_ids_and_flags_unknown(self):
+        nosec = self._parse("# nosec: B602, B999999")
+        self.assertFalse(nosec.blanket)
+        self.assertEqual({"B602"}, nosec.test_ids)
+        self.assertEqual(["B999999"], nosec.invalid_tokens)
+        self.assertTrue(nosec.has_effect)
+
+    def test_duplicate_ids_collapse(self):
+        nosec = self._parse("# nosec: B602, B602")
+        self.assertFalse(nosec.blanket)
+        self.assertEqual({"B602"}, nosec.test_ids)
+        self.assertEqual([], nosec.invalid_tokens)
+
+    def test_short_test_name_resolves_to_id(self):
+        nosec = self._parse(
+            "# nosec subprocess_popen_with_shell_equals_true"
+        )
+        self.assertFalse(nosec.blanket)
+        self.assertEqual({"B602"}, nosec.test_ids)
+        self.assertEqual([], nosec.invalid_tokens)
+
+    def test_mixed_id_and_name_with_typo(self):
+        nosec = self._parse(
+            "# nosec: B602, subprocess_popen_with_shell_equals_true, B999999"
+        )
+        self.assertEqual({"B602"}, nosec.test_ids)
+        self.assertEqual(["B999999"], nosec.invalid_tokens)
+
+    def test_partial_valid_without_colon_keeps_valid_constraint(self):
+        nosec = self._parse("# nosec B602, B999999")
+        self.assertFalse(nosec.blanket)
+        self.assertEqual({"B602"}, nosec.test_ids)
+        self.assertEqual(["B999999"], nosec.invalid_tokens)
+
+    def test_comment_after_list_is_ignored(self):
+        nosec = self._parse(
+            "# type: ignore # nosec B602 # noqa: E501"
+        )
+        self.assertEqual({"B602"}, nosec.test_ids)
+        self.assertFalse(nosec.blanket)

@@ -778,6 +778,64 @@ class FunctionalTests(testtools.TestCase):
         }
         self.check_example("nosec.py", expect)
 
+    def test_nosec_invalid_ids(self):
+        """Unknown ids must not collapse into blanket suppression.
+
+        Only a bare nosec suppresses a whole line. A colon-form list whose
+        ids do not resolve suppresses nothing, a partially valid list keeps
+        its valid constraint while reporting the rest, and a nosec inside a
+        string is ignored entirely.
+        """
+        expect = {
+            "SEVERITY": {"UNDEFINED": 0, "LOW": 6, "MEDIUM": 0, "HIGH": 0},
+            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 6},
+        }
+        self.check_example("nosec_invalid_ids.py", expect)
+
+        issues = self.b_mgr.get_issue_list()
+        issue_lines = sorted((issue.lineno, issue.test_id) for issue in issues)
+        # The all-invalid comment on line 6 previously hid this finding;
+        # the partial list on line 10 still suppresses B607 but keeps B602,
+        # and the multi-line call on lines 25-26 reports on the kwarg line.
+        self.assertEqual(
+            [
+                (1, "B404"),
+                (6, "B602"),
+                (10, "B602"),
+                (26, "B602"),
+                (29, "B602"),
+                (29, "B607"),
+            ],
+            issue_lines,
+        )
+
+        # One bare nosec (line 21) and two explicit rule suppressions:
+        # the named rule on lines 14-16 and the duplicated B602 on line 18.
+        self.check_metrics(
+            "nosec_invalid_ids.py",
+            {"nosec": 1, "skipped_tests": 2},
+        )
+
+        # With --ignore-nosec every raw finding remains visible, including
+        # the lines covered by valid bare and rule-specific suppressions.
+        # Use a fresh manager because results accumulate across runs.
+        ignore_manager = b_manager.BanditManager(
+            self.b_mgr.b_conf, "file"
+        )
+        ignore_manager.b_conf._settings["plugins_dir"] = os.path.join(
+            os.getcwd(), "bandit", "plugins"
+        )
+        ignore_manager.b_ts = b_test_set.BanditTestSet(
+            config=self.b_mgr.b_conf
+        )
+        path = os.path.join(
+            os.getcwd(), "examples", "nosec_invalid_ids.py"
+        )
+        ignore_manager.ignore_nosec = True
+        ignore_manager.discover_files([path], True)
+        ignore_manager.run_tests()
+        self.assertEqual(9, ignore_manager.results_count())
+
     def test_baseline_filter(self):
         issue_text = (
             "A Flask app appears to be run with debug=True, which "
