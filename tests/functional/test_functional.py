@@ -378,6 +378,14 @@ class FunctionalTests(testtools.TestCase):
         }
         self.check_example("requests-ssl-verify-disabled.py", expect)
 
+    def test_requests_ssl_verify_options_dict(self):
+        """Test for verify=False passed through **options dicts."""
+        expect = {
+            "SEVERITY": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 11},
+            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 2, "HIGH": 9},
+        }
+        self.check_example("requests-ssl-verify-options-dict.py", expect)
+
     def test_requests_without_timeout(self):
         """Test for the `requests` library missing timeouts."""
         expect = {
