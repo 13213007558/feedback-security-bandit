@@ -7,6 +7,7 @@ import re
 
 import bandit
 from bandit.core import issue
+from bandit.core import taint
 from bandit.core import test_properties as test
 
 # yuck, regex: starts with a windows drive letter (eg C:)
@@ -23,6 +24,30 @@ def _evaluate_shell_call(context):
         return bandit.LOW
     else:
         return bandit.HIGH
+
+
+def _taint_note(context, config):
+    """Optional intra-function source analysis for shell commands.
+
+    When ``source_analysis`` is enabled in the ``shell_injection``
+    configuration, track os.environ, sys.argv and input() through
+    local assignments to the shell command string and describe the
+    path.  This only ever adds information to an issue; it never
+    lowers an existing severity.  Calls using an argument list with
+    shell=False are not shell command strings and are not analyzed.
+    """
+    if not isinstance(config, dict) or not config.get("source_analysis"):
+        return ""
+    try:
+        report = taint.analyze_call(context.node, context.import_aliases)
+    except Exception:  # never let optional analysis break a scan
+        return ""
+    if report is None:
+        return ""
+    note = report.format()
+    if note:
+        return " Taint analysis: " + note + "."
+    return ""
 
 
 def gen_config(name):
@@ -75,6 +100,10 @@ def gen_config(name):
                 "os.spawnvpe",
                 "os.startfile",
             ],
+            # Optional intra-function taint analysis: track os.environ,
+            # sys.argv and input() into shell command strings and
+            # annotate issues with the source and propagation path.
+            "source_analysis": False,
         }
 
 
@@ -161,6 +190,10 @@ def subprocess_popen_with_shell_equals_true(context, config):
                 - subprocess.Popen
                 - subprocess.call
 
+            # Optional: annotate issues with intra-function taint
+            # paths from os.environ, sys.argv and input() into the
+            # shell command string (default false).
+            source_analysis: true
 
     :Example:
 
@@ -226,7 +259,7 @@ def subprocess_popen_with_shell_equals_true(context, config):
                         confidence=bandit.HIGH,
                         cwe=issue.Cwe.OS_COMMAND_INJECTION,
                         text="subprocess call with shell=True identified, "
-                        "security issue.",
+                        "security issue." + _taint_note(context, config),
                         lineno=context.get_lineno_for_call_arg("shell"),
                     )
 
@@ -501,7 +534,8 @@ def start_process_with_a_shell(context, config):
                     confidence=bandit.HIGH,
                     cwe=issue.Cwe.OS_COMMAND_INJECTION,
                     text="Starting a process with a shell, possible injection"
-                    " detected, security issue.",
+                    " detected, security issue."
+                    + _taint_note(context, config),
                 )
 
 
