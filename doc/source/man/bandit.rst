@@ -9,8 +9,8 @@ bandit [-h] [-r] [-a {file,vuln}] [-n CONTEXT_LINES] [-c CONFIG_FILE]
             [-p PROFILE] [-t TESTS] [-s SKIPS] [-l] [-i]
             [-f {csv,custom,html,json,screen,txt,xml,yaml}]
             [--msg-template MSG_TEMPLATE] [-o [OUTPUT_FILE]] [-v] [-d] [-q]
-            [--ignore-nosec] [-x EXCLUDED_PATHS] [-b BASELINE]
-            [--ini INI_PATH] [--exit-zero] [--version]
+            [--ignore-nosec] [--cache-dir CACHE_DIR] [-x EXCLUDED_PATHS]
+            [-b BASELINE] [--ini INI_PATH] [--exit-zero] [--version]
             [targets [targets ...]]
 
 DESCRIPTION
@@ -65,6 +65,11 @@ OPTIONS
   -q, --quiet, --silent
                         only show output in the case of an error
   --ignore-nosec        do not skip lines with # nosec comments
+  --cache-dir CACHE_DIR
+                        optional directory used to cache per-file scan
+                        results; files whose source, enabled rules, rule
+                        configuration and environment are unchanged are not
+                        re-analyzed on later runs
   -x EXCLUDED_PATHS, --exclude EXCLUDED_PATHS
                         comma-separated list of paths (glob patterns
                         supported) to exclude from scan (note that these are

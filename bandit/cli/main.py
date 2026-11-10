@@ -336,6 +336,16 @@ def main():
         help="do not skip lines with # nosec comments",
     )
     parser.add_argument(
+        "--cache-dir",
+        dest="cache_dir",
+        action="store",
+        default=None,
+        type=str,
+        help="optional directory used to cache per-file scan results; "
+        "files whose source, enabled rules, rule configuration and "
+        "environment are unchanged are not re-analyzed on later runs",
+    )
+    parser.add_argument(
         "-x",
         "--exclude",
         dest="excluded_paths",
@@ -635,6 +645,7 @@ def main():
         verbose=args.verbose,
         quiet=args.quiet,
         ignore_nosec=args.ignore_nosec,
+        cache_dir=args.cache_dir,
     )
 
     if args.baseline is not None:

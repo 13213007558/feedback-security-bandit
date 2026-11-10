@@ -15,6 +15,7 @@ import traceback
 
 from rich import progress
 
+from bandit.core import cache as b_cache
 from bandit.core import constants as b_constants
 from bandit.core import extension_loader
 from bandit.core import issue
@@ -41,6 +42,7 @@ class BanditManager:
         quiet=False,
         profile=None,
         ignore_nosec=False,
+        cache_dir=None,
     ):
         """Get logger, config, AST handler, and result store ready
 
@@ -52,6 +54,9 @@ class BanditManager:
         :param quiet: Whether to only show output in the case of an error
         :param profile_name: Optional name of profile to use (from cmd line)
         :param ignore_nosec: Whether to ignore #nosec or not
+        :param cache_dir: Optional directory for a per-file scan cache;
+            files whose source and scan environment are unchanged are
+            not re-analyzed on subsequent runs
         :return:
         """
         self.debug = debug
@@ -71,6 +76,8 @@ class BanditManager:
         self.metrics = metrics.Metrics()
         self.b_ts = b_test_set.BanditTestSet(config, profile)
         self.scores = []
+        self.cache_dir = cache_dir
+        self._cache = None
 
     def get_skipped(self):
         ret = []
@@ -266,6 +273,11 @@ class BanditManager:
         # if we have problems with a file, we'll remove it from the files_list
         # and add it to the skipped list instead
         new_files_list = list(self.files_list)
+        if self.cache_dir:
+            self._cache = b_cache.ScanCache(
+                self.cache_dir, self.b_ts, self.ignore_nosec
+            )
+            self._cache.load()
         if (
             len(self.files_list) > PROGRESS_THRESHOLD
             and LOG.getEffectiveLevel() <= logging.INFO
@@ -295,6 +307,9 @@ class BanditManager:
         # reflect any files which may have been skipped
         self.files_list = new_files_list
 
+        if self._cache is not None:
+            self._cache.save()
+
         # do final aggregation of metrics
         self.metrics.aggregate()
 
@@ -302,6 +317,11 @@ class BanditManager:
         try:
             # parse the current file
             data = fdata.read()
+            if self._cache is not None and fname != "<stdin>":
+                entry = self._cache.lookup(fname, data)
+                if entry is not None:
+                    self._replay_cached_result(fname, fdata, entry)
+                    return
             lines = data.splitlines()
             self.metrics.begin(fname)
             self.metrics.count_locs(lines)
@@ -319,9 +339,20 @@ class BanditManager:
 
             except tokenize.TokenError:
                 pass
+            results_before = len(self.results)
             score = self._execute_ast_visitor(fname, fdata, data, nosec_lines)
             self.scores.append(score)
             self.metrics.count_issues([score])
+            if self._cache is not None and fname != "<stdin>":
+                # only fully scanned files are recorded; a file that
+                # raises out of this block is never marked complete
+                self._cache.store(
+                    fname,
+                    data,
+                    self.results[results_before:],
+                    score,
+                    self.metrics.data[fname],
+                )
         except KeyboardInterrupt:
             sys.exit(2)
         except SyntaxError:
@@ -342,6 +373,24 @@ class BanditManager:
             new_files_list.remove(fname)
             LOG.debug("  Exception string: %s", e)
             LOG.debug("  Exception traceback: %s", traceback.format_exc())
+
+    def _replay_cached_result(self, fname, fdata, entry):
+        """Replay a cached per-file result as if the file was just scanned.
+
+        Issues are rebuilt bound to the file name of this run, and the
+        stored per-file metrics block replaces (not accumulates onto) the
+        current one, so a cache hit never double counts.
+        """
+        LOG.debug("using cached scan result for file : %s", fname)
+        issues = [
+            b_cache.issue_from_dict(item, fname, fdata)
+            for item in entry["issues"]
+        ]
+        self.results.extend(issues)
+        score = {key: list(val) for key, val in entry["score"].items()}
+        self.scores.append(score)
+        self.metrics.data[fname] = dict(entry["metrics"])
+        self.metrics.current = self.metrics.data[fname]
 
     def _execute_ast_visitor(self, fname, fdata, data, nosec_lines):
         """Execute AST parse on each file
